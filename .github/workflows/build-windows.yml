@@ -1,0 +1,209 @@
+name: Build Windows installer
+
+# Produces ShannonSetup.exe. The author has no Windows machine, so this
+# workflow is the only way the installer gets built or tested.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for the installer"
+        default: "0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  PY_VERSION: "3.12.10"          # must stay 3.12.x - the wheels are cp312
+  TURBO_REPO: mobiuslabsgmbh/faster-whisper-large-v3-turbo
+  SHERPA_REL: https://github.com/k2-fsa/sherpa-onnx/releases/download
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: ver
+        shell: bash
+        run: |
+          V="${{ github.event.inputs.version }}"
+          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
+          [ -z "$V" ] && V="0.0.0"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building version $V"
+
+      # ---------------------------------------------------------------
+      # Embeddable CPython. Chosen over PyInstaller because its layout is
+      # byte-identical to a normal pip install, which is what ctranslate2,
+      # av and sherpa-onnx all assume when they locate their DLLs.
+      # ---------------------------------------------------------------
+      - name: Fetch embeddable CPython
+        shell: pwsh
+        run: |
+          $url = "https://www.python.org/ftp/python/$env:PY_VERSION/python-$env:PY_VERSION-embed-amd64.zip"
+          Invoke-WebRequest $url -OutFile py.zip
+          New-Item -ItemType Directory -Force -Path build\python | Out-Null
+          Expand-Archive py.zip -DestinationPath build\python -Force
+          # The embeddable build disables site by default, so pip-installed
+          # packages are invisible. Enable it and add Lib\site-packages.
+          $pth = Get-ChildItem build\python\python*._pth | Select-Object -First 1
+          @"
+          python312.zip
+          .
+          Lib\site-packages
+
+          # Uncommented deliberately: without this, imports fail.
+          import site
+          "@ | Set-Content -Encoding ASCII $pth.FullName
+          Get-Content $pth.FullName
+
+      - name: Install pip into it
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://bootstrap.pypa.io/get-pip.py -OutFile get-pip.py
+          .\build\python\python.exe get-pip.py --no-warn-script-location
+          .\build\python\python.exe -m pip --version
+
+      - name: Install pinned dependencies
+        shell: pwsh
+        run: |
+          .\build\python\python.exe -m pip install `
+            --no-warn-script-location `
+            --only-binary=:all: `
+            -r requirements-win.txt
+          # --only-binary is a hard gate: the target machine has no compiler,
+          # so a source distribution slipping in must fail the build here.
+
+      - name: Prove the stack imports and the DLLs resolve
+        shell: pwsh
+        run: |
+          .\build\python\python.exe -c @"
+          import onnxruntime, sherpa_onnx, ctranslate2, av, docx, numpy
+          print('onnxruntime', onnxruntime.__version__)
+          print('sherpa_onnx', sherpa_onnx.__version__ if hasattr(sherpa_onnx,'__version__') else 'ok')
+          print('ctranslate2', ctranslate2.__version__)
+          print('av', av.__version__)
+          print('numpy', numpy.__version__)
+          "@
+          # This step is the real test of the MSVCP140.dll question and of the
+          # ONNX Runtime base-name collision. If it passes, both are settled.
+
+      - name: Cache models
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-turbo-v1
+
+      - name: Fetch models
+        if: steps.models.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path models\faster-whisper-large-v3-turbo | Out-Null
+          $base = "https://huggingface.co/$env:TURBO_REPO/resolve/main"
+          foreach ($f in @("model.bin","config.json","tokenizer.json","vocabulary.json","preprocessor_config.json")) {
+            Invoke-WebRequest "$base/$f" -OutFile "models\faster-whisper-large-v3-turbo\$f"
+          }
+          # Diarization: ungated GitHub release assets, no HF token anywhere.
+          Invoke-WebRequest "$env:SHERPA_REL/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2" -OutFile seg.tar.bz2
+          tar -xjf seg.tar.bz2 -C models
+          Invoke-WebRequest "$env:SHERPA_REL/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx" -OutFile "models\wespeaker_en_voxceleb_resnet34_LM.onnx"
+          Remove-Item seg.tar.bz2
+
+      - name: Check the model payload looks right
+        shell: pwsh
+        run: |
+          $m = "models\faster-whisper-large-v3-turbo\model.bin"
+          $size = (Get-Item $m).Length
+          Write-Host "model.bin = $size bytes"
+          if ($size -ne 1617884929) { throw "model.bin is $size bytes, expected 1617884929 - truncated download" }
+          foreach ($p in @("models\sherpa-onnx-pyannote-segmentation-3-0\model.onnx",
+                           "models\wespeaker_en_voxceleb_resnet34_LM.onnx")) {
+            if (-not (Test-Path $p)) { throw "missing $p" }
+          }
+
+      # ---------------------------------------------------------------
+      # End-to-end smoke test ON WINDOWS. This is the only place the whole
+      # thing runs on the target OS before it reaches a user.
+      # ---------------------------------------------------------------
+      - name: Smoke test with real speech
+        shell: pwsh
+        run: |
+          # Real speech, not a sine wave: a test that cannot fail is worse than
+          # no test. An 11-second public domain clip from the Whisper repo.
+          Invoke-WebRequest "https://raw.githubusercontent.com/openai/whisper/main/tests/jfk.flac" -OutFile jfk.flac
+          .\build\python\python.exe transcribe.py jfk.flac --speakers 1 --model large-v3-turbo --format both --out smoke
+          if (-not (Test-Path "smoke.md"))   { throw "no markdown written" }
+          if (-not (Test-Path "smoke.docx")) { throw "no docx written" }
+          $md = Get-Content smoke.md -Raw
+          Write-Host "--- transcript ---"; Write-Host $md
+          # Assert the WORDS came out, not merely that a file exists.
+          if ($md -notmatch "fellow Americans") {
+            throw "transcription produced no recognisable text - pipeline is broken"
+          }
+          if ($md -notmatch "SPEAKER_") { throw "no speaker label in output" }
+          if ((Get-Item smoke.docx).Length -lt 10000) { throw "docx suspiciously small" }
+          Write-Host "Transcription, diarization, markdown and docx all verified on Windows."
+          Remove-Item jfk.flac, smoke.md, smoke.docx
+
+      - name: Check the MP3 path specifically
+        shell: pwsh
+        run: |
+          # MP3 is the format the user actually has. It decodes through a
+          # different PyAV path than WAV/FLAC, so test it explicitly.
+          Invoke-WebRequest "https://raw.githubusercontent.com/openai/whisper/main/tests/jfk.flac" -OutFile jfk.flac
+          .\build\python\python.exe -c @"
+          import av, numpy as np
+          inp = av.open('jfk.flac')
+          out = av.open('jfk.mp3', 'w')
+          st = out.add_stream('mp3', rate=44100)
+          res = av.audio.resampler.AudioResampler(format='s16', layout='stereo', rate=44100)
+          for f in inp.decode(audio=0):
+              for r in res.resample(f):
+                  for pkt in st.encode(r): out.mux(pkt)
+          for pkt in st.encode(None): out.mux(pkt)
+          out.close(); inp.close()
+          print('wrote jfk.mp3')
+          "@
+          .\build\python\python.exe transcribe.py jfk.mp3 --speakers 1 --format md --out mp3test
+          $md = Get-Content mp3test.md -Raw
+          if ($md -notmatch "fellow Americans") { throw "MP3 decode path is broken" }
+          Write-Host "MP3 input verified."
+          Remove-Item jfk.flac, jfk.mp3, mp3test.md
+
+      - name: Build the installer
+        shell: pwsh
+        env:
+          SHANNON_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc /Qp "windows\shannon.iss"
+          Get-ChildItem windows\Output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShannonSetup-${{ steps.ver.outputs.version }}
+          path: windows/Output/ShannonSetup.exe
+          compression-level: 0        # already lzma2-compressed
+          retention-days: 30
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: windows/Output/ShannonSetup.exe
+          body: |
+            Double-click `ShannonSetup.exe` to install to `C:\Shannon`.
+
+            Transcribes recordings entirely on your own computer. Nothing is
+            uploaded and no internet connection is needed after installing.
+
+            **Transcripts contain errors that can change clinical meaning.
+            Read and correct them before use.**

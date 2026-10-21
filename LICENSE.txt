@@ -1,0 +1,24 @@
+Shannon
+
+This tool is assembled from open-source components, all of which permit
+commercial use:
+
+  faster-whisper            MIT
+  CTranslate2               MIT
+  sherpa-onnx               Apache-2.0
+  ONNX Runtime              MIT
+  PyAV                      BSD-3-Clause
+  python-docx               MIT
+  NumPy                     BSD-3-Clause
+
+Models included:
+
+  faster-whisper-large-v3-turbo         MIT
+    (mobiuslabsgmbh/faster-whisper-large-v3-turbo)
+  sherpa-onnx-pyannote-segmentation-3-0 MIT, Copyright (c) 2022 CNRS
+  wespeaker_en_voxceleb_resnet34_LM     Apache-2.0
+
+NO WARRANTY. This software produces machine transcripts that contain errors,
+including errors that change clinical meaning - lost negations, swapped
+left/right, dropped symptoms. Transcripts must be read and corrected by a
+human before being relied upon or entered into any clinical record.
