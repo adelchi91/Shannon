@@ -10,6 +10,7 @@ one-off model download on first run; after that it works with the wifi off.
 import argparse
 import itertools
 import os
+import re
 import sys
 import tarfile
 import urllib.request
@@ -258,6 +259,27 @@ def stamp(seconds):
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
 
+def format_segment_text(text):
+    """Make Whisper segment boundaries readable when punctuation is missing.
+
+    Whisper usually emits punctuation, but conversational speech can arrive as
+    lowercase fragments with no terminal mark. Its segment boundaries are the
+    best offline fallback we already have: use them as sentence boundaries
+    without changing any punctuation the model did provide.
+    """
+    text = text.strip()
+    if not text:
+        return text
+    text = re.sub(r"\bi\b", "I", text)
+    first_letter = re.search(r"[A-Za-z]", text)
+    if first_letter and first_letter.group().islower():
+        i = first_letter.start()
+        text = text[:i] + text[i].upper() + text[i + 1:]
+    if not re.search(r"[.!?][\"')\]]*$", text):
+        text += "."
+    return text
+
+
 def group_by_speaker(segments, turns):
     """[(speaker, timestamp, [line, ...]), ...] - consecutive runs of one speaker."""
     blocks = []
@@ -265,7 +287,7 @@ def group_by_speaker(segments, turns):
         who = speaker_for(start, end, turns)
         if not blocks or blocks[-1][0] != who:
             blocks.append((who, stamp(start), []))
-        blocks[-1][2].append(text)
+        blocks[-1][2].append(format_segment_text(text))
     return blocks
 
 
