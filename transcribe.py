@@ -280,6 +280,25 @@ def format_segment_text(text):
     return text
 
 
+def available_output_base(base, output_format):
+    """Return a base whose requested output files do not already exist.
+
+    Word locks open documents on Windows. Never overwrite an earlier transcript:
+    choose ``name_2``, ``name_3``, etc. before the expensive transcription run.
+    """
+    suffixes = {
+        "md": (".md",),
+        "docx": (".docx",),
+        "both": (".md", ".docx"),
+    }[output_format]
+    candidate = base
+    number = 2
+    while any(candidate.with_suffix(suffix).exists() for suffix in suffixes):
+        candidate = base.with_name(f"{base.stem}_{number}{base.suffix}")
+        number += 1
+    return candidate
+
+
 def group_by_speaker(segments, turns):
     """[(speaker, timestamp, [line, ...]), ...] - consecutive runs of one speaker."""
     blocks = []
@@ -354,6 +373,11 @@ def main():
         sys.exit(f"Refusing to write into a cloud-synced folder:\n  {out}\n"
                  f"That would upload the transcript. Move the recording to a "
                  f"local folder (e.g. C:\\Shannon), or pass --out.")
+    available = available_output_base(out, args.format)
+    if available != out:
+        print(f"Output already exists; writing this run as {available.stem}",
+              file=sys.stderr)
+        out = available
 
     fetch_models()
     # Models are on disk now. Bolt the door so nothing reaches for the network
